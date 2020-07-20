@@ -1,18 +1,48 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using NLog;
+using Shadowsocks.Controller;
+using Shadowsocks.Model;
+using Shadowsocks.Properties;
+using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
-using Shadowsocks.Controller;
-using Shadowsocks.Properties;
-using Shadowsocks.Model;
-using Newtonsoft.Json;
 
 namespace Shadowsocks.Util.SystemProxy
 {
     public static class Sysproxy
     {
+        private static Logger logger = LogManager.GetCurrentClassLogger();
+
         private const string _userWininetConfigFile = "user-wininet.json";
+
+        private readonly static string[] _lanIP = {
+            "<local>",
+            "localhost",
+            "127.*",
+            "10.*",
+            "172.16.*",
+            "172.17.*",
+            "172.18.*",
+            "172.19.*",
+            "172.20.*",
+            "172.21.*",
+            "172.22.*",
+            "172.23.*",
+            "172.24.*",
+            "172.25.*",
+            "172.26.*",
+            "172.27.*",
+            "172.28.*",
+            "172.29.*",
+            "172.30.*",
+            "172.31.*",
+            "192.168.*"
+            };
+
 
         private static string _queryStr;
 
@@ -43,7 +73,7 @@ namespace Shadowsocks.Util.SystemProxy
             }
             catch (IOException e)
             {
-                Logging.LogUsefulException(e);
+                logger.LogUsefulException(e);
             }
         }
 
@@ -61,8 +91,14 @@ namespace Shadowsocks.Util.SystemProxy
             string arguments;
             if (enable)
             {
+                string customBypassString = _userSettings.BypassList ?? "";
+                List<string> customBypassList = new List<string>(customBypassString.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                customBypassList.AddRange(_lanIP);
+                string[] realBypassList = customBypassList.Distinct().ToArray();
+                string realBypassString = string.Join(";", realBypassList);
+
                 arguments = global
-                    ? $"global {proxyServer} <local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*"
+                    ? $"global {proxyServer} {realBypassString}"
                     : $"pac {pacURL}";
             }
             else
@@ -80,6 +116,25 @@ namespace Shadowsocks.Util.SystemProxy
 
             Save();
             ExecSysproxy(arguments);
+        }
+
+        // set system proxy to 1 (null) (null) (null)
+        public static bool ResetIEProxy()
+        {
+            try
+            {
+                // clear user-wininet.json
+                _userSettings = new SysproxyConfig();
+                Save();
+                // clear system setting
+                ExecSysproxy("set 1 - - -");
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+
+            return true;
         }
 
         private static void ExecSysproxy(string arguments)
@@ -132,27 +187,35 @@ namespace Shadowsocks.Util.SystemProxy
                             error.AppendLine(e.Data);
                         }
                     };
+                    try
+                    {
+                        process.Start();
 
-                    process.Start();
+                        process.BeginErrorReadLine();
+                        process.BeginOutputReadLine();
 
-                    process.BeginErrorReadLine();
-                    process.BeginOutputReadLine();
-
-                    process.WaitForExit();
-
+                        process.WaitForExit();
+                    }
+                    catch (System.ComponentModel.Win32Exception e)
+                    {
+                        // log the arguments
+                        throw new ProxyException(ProxyExceptionType.FailToRun, process.StartInfo.Arguments, e);
+                    }
                     var stderr = error.ToString();
                     var stdout = output.ToString();
 
                     var exitCode = process.ExitCode;
                     if (exitCode != (int)RET_ERRORS.RET_NO_ERROR)
                     {
-                        throw new ProxyException(stderr);
+                        throw new ProxyException(ProxyExceptionType.SysproxyExitError, stderr);
                     }
 
-                    if (arguments == "query") {
-                        if (stdout.IsNullOrWhiteSpace() || stdout.IsNullOrEmpty()) {
+                    if (arguments == "query")
+                    {
+                        if (stdout.IsNullOrWhiteSpace() || stdout.IsNullOrEmpty())
+                        {
                             // we cannot get user settings
-                            throw new ProxyException("failed to query wininet settings");
+                            throw new ProxyException(ProxyExceptionType.QueryReturnEmpty);
                         }
                         _queryStr = stdout;
                     }
@@ -173,7 +236,7 @@ namespace Shadowsocks.Util.SystemProxy
             }
             catch (IOException e)
             {
-                Logging.LogUsefulException(e);
+                logger.LogUsefulException(e);
             }
         }
 
@@ -183,9 +246,13 @@ namespace Shadowsocks.Util.SystemProxy
             {
                 string configContent = File.ReadAllText(Utils.GetTempPath(_userWininetConfigFile));
                 _userSettings = JsonConvert.DeserializeObject<SysproxyConfig>(configContent);
-            } catch(Exception) {
+            }
+            catch (Exception)
+            {
                 // Suppress all exceptions. finally block will initialize new user config settings.
-            } finally {
+            }
+            finally
+            {
                 if (_userSettings == null) _userSettings = new SysproxyConfig();
             }
         }
@@ -193,6 +260,21 @@ namespace Shadowsocks.Util.SystemProxy
         private static void ParseQueryStr(string str)
         {
             string[] userSettingsArr = str.Split(new string[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+
+            // sometimes sysproxy output in utf16le instead of ascii
+            // manually translate it
+            if (userSettingsArr.Length != 4)
+            {
+                byte[] strByte = Encoding.ASCII.GetBytes(str);
+                str = Encoding.Unicode.GetString(strByte);
+                userSettingsArr = str.Split(new string[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+                // still fail, throw exception with string hexdump
+                if (userSettingsArr.Length != 4)
+                {
+                    throw new ProxyException(ProxyExceptionType.QueryReturnMalformed, BitConverter.ToString(strByte));
+                }
+            }
+
             _userSettings.Flags = userSettingsArr[0];
 
             // handle output from WinINET
